@@ -1,39 +1,33 @@
 #!/usr/bin/env python
-"""
-Converts a mitmproxy dump file to a swagger schema.
-"""
+# -*- coding: utf-8 -*-
+"""Converts a mitmproxy dump file to a swagger schema."""
+import argparse
+import json
 import os
+import re
 import sys
 import traceback
-from mitmproxy.exceptions import FlowReadException
-import json
-import argparse
+import urllib
+from typing import Any, Optional, Sequence, Union
+
+import msgpack
 import ruamel.yaml
-import re
-from . import swagger_util
-from .har_capture_reader import HarCaptureReader, har_archive_heuristic
-from .mitmproxy_capture_reader import (
+from mitmproxy.exceptions import FlowReadException
+
+from mitmproxy2swagger import console_util, swagger_util
+from mitmproxy2swagger.har_capture_reader import HarCaptureReader, har_archive_heuristic
+from mitmproxy2swagger.mitmproxy_capture_reader import (
     MitmproxyCaptureReader,
     mitmproxy_dump_file_huristic,
 )
-from . import console_util
-import urllib
 
 
 def path_to_regex(path):
     # replace the path template with a regex
-    path = path.replace("\\", "\\\\")
-    path = path.replace("{", "(?P<")
-    path = path.replace("}", ">[^/]+)")
-    path = path.replace("*", ".*")
-    path = path.replace("/", "\\/")
-    path = path.replace("?", "\\?")
-    path = path.replace("(", "\\(")
-    path = path.replace(")", "\\)")
-    path = path.replace(".", "\\.")
-    path = path.replace("+", "\\+")
-    path = path.replace("[", "\\[")
-    path = path.replace("]", "\\]")
+    path = re.escape(path)
+    path = path.replace(r"\{", "(?P<")
+    path = path.replace(r"\}", ">[^/]+)")
+    path = path.replace(r"\*", ".*")
     return "^" + path + "$"
 
 
@@ -62,7 +56,7 @@ def detect_input_format(file_path):
     return MitmproxyCaptureReader(file_path, progress_callback)
 
 
-def main():
+def main(override_args: Optional[Sequence[str]] = None):
     parser = argparse.ArgumentParser(
         description="Converts a mitmproxy dump file or HAR to a swagger schema."
     )
@@ -86,16 +80,42 @@ def main():
         help="Include examples in the schema. This might expose sensitive information.",
     )
     parser.add_argument(
+        "-hd",
+        "--headers",
+        action="store_true",
+        help="Include headers in the schema. This might expose sensitive information.",
+    )
+    parser.add_argument(
         "-f",
         "--format",
         choices=["flow", "har"],
         help="Override the input file format auto-detection.",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "-r",
+        "--param-regex",
+        default="[0-9]+",
+        help="Regex to match parameters in the API paths. Path segments that match this regex will be turned into parameter placeholders.",
+    )
+    parser.add_argument(
+        "-s",
+        "--suppress-params",
+        action="store_true",
+        help="Do not include API paths that have the original parameter values, only the ones with placeholders.",
+    )
+    args = parser.parse_args(override_args)
+
+    try:
+        args.param_regex = re.compile("^" + args.param_regex + "$")
+    except re.error as e:
+        print(
+            f"{console_util.ANSI_RED}Invalid path parameter regex: {e}{console_util.ANSI_RESET}"
+        )
+        sys.exit(1)
 
     yaml = ruamel.yaml.YAML()
 
-    capture_reader = None
+    capture_reader: Union[MitmproxyCaptureReader, HarCaptureReader]
     if args.format == "flow" or args.format == "mitmproxy":
         capture_reader = MitmproxyCaptureReader(args.input, progress_callback)
     elif args.format == "har":
@@ -107,11 +127,13 @@ def main():
 
     # try loading the existing swagger file
     try:
-        with open(args.output, "r") as f:
+        base_dir = os.getcwd()
+        relative_path = args.output
+        abs_path = os.path.join(base_dir, relative_path)
+        with open(abs_path, "r") as f:
             swagger = yaml.load(f)
     except FileNotFoundError:
         print("No existing swagger file found. Creating new one.")
-        pass
     if swagger is None:
         swagger = ruamel.yaml.comments.CommentedMap(
             {
@@ -151,19 +173,18 @@ def main():
 
     # new endpoints will be added here so that they can be added as comments in the swagger file
     new_path_templates = []
-    for path in path_templates:
-        re.compile(path_to_regex(path))
     path_template_regexes = [re.compile(path_to_regex(path)) for path in path_templates]
 
     try:
-        for f in capture_reader.captured_requests():
+        for req in capture_reader.captured_requests():
             # strip the api prefix from the url
-            url = f.get_url()
-            if not url.startswith(args.api_prefix):
+            url = req.get_matching_url(args.api_prefix)
+
+            if url is None:
                 continue
-            method = f.get_method().lower()
+            method = req.get_method().lower()
             path = strip_query_string(url).removeprefix(args.api_prefix)
-            status = f.get_response_status_code()
+            status = req.get_response_status_code()
 
             # check if the path matches any of the path templates, and save the index
             path_template_index = None
@@ -192,29 +213,47 @@ def main():
             )
 
             params = swagger_util.url_to_params(url, path_template_to_set)
-
+            if args.headers:
+                headers_request = swagger_util.request_to_headers(
+                    req.get_request_headers()
+                )
+                if headers_request is not None and len(headers_request) > 0:
+                    set_key_if_not_exists(
+                        swagger["paths"][path_template_to_set][method],
+                        "parameters",
+                        headers_request,
+                    )
             if params is not None and len(params) > 0:
                 set_key_if_not_exists(
                     swagger["paths"][path_template_to_set][method], "parameters", params
                 )
 
             if method not in ["get", "head"]:
-                body = f.get_request_body()
+                body = req.get_request_body()
                 if body is not None:
                     body_val = None
                     content_type = None
                     # try to parse the body as json
                     try:
-                        body_val = json.loads(f.get_request_body())
+                        body_val = json.loads(req.get_request_body())
                         content_type = "application/json"
                     except UnicodeDecodeError:
                         pass
                     except json.decoder.JSONDecodeError:
                         pass
+
+                    # try to parse the body as msgpack, if it's not json
+                    if body_val is None:
+                        try:
+                            body_val = msgpack.loads(req.get_request_body())
+                            content_type = "application/msgpack"
+                        except Exception:
+                            pass
+
                     if content_type is None:
                         # try to parse the body as form data
                         try:
-                            body_val_bytes = dict(
+                            body_val_bytes: Any = dict(
                                 urllib.parse.parse_qsl(
                                     body, encoding="utf-8", keep_blank_values=True
                                 )
@@ -240,42 +279,73 @@ def main():
                             }
                         }
                         if args.examples:
-                            content_to_set["content"][content_type][
-                                "example"
-                            ] = swagger_util.limit_example_size(body_val)
+                            content_to_set["content"][content_type]["example"] = (
+                                swagger_util.limit_example_size(body_val)
+                            )
                         set_key_if_not_exists(
                             swagger["paths"][path_template_to_set][method],
                             "requestBody",
                             content_to_set,
                         )
 
-            # try parsing the response as json
-            response_body = f.get_response_body()
+            response_body = req.get_response_body()
             if response_body is not None:
+                # try parsing the response as json
                 try:
-                    response_json = json.loads(response_body)
+                    response_parsed = json.loads(response_body)
+                    response_content_type = "application/json"
                 except UnicodeDecodeError:
-                    response_json = None
+                    response_parsed = None
                 except json.decoder.JSONDecodeError:
-                    response_json = None
-                if response_json is not None:
+                    response_parsed = None
+
+                if response_parsed is None:
+                    # try parsing the response as msgpack, if it's not json
+                    try:
+                        response_parsed = msgpack.loads(response_body)
+                        response_content_type = "application/msgpack"
+                    except Exception:
+                        response_parsed = None
+
+                if response_parsed is not None:
                     resp_data_to_set = {
-                        "description": f.get_response_reason(),
+                        "description": req.get_response_reason(),
                         "content": {
-                            "application/json": {
-                                "schema": swagger_util.value_to_schema(response_json)
+                            response_content_type: {
+                                "schema": swagger_util.value_to_schema(response_parsed)
                             }
                         },
                     }
                     if args.examples:
-                        resp_data_to_set["content"]["application/json"][
+                        resp_data_to_set["content"][response_content_type][
                             "example"
-                        ] = swagger_util.limit_example_size(response_json)
+                        ] = swagger_util.limit_example_size(response_parsed)
+                    if args.headers:
+                        resp_data_to_set["headers"] = swagger_util.response_to_headers(
+                            req.get_response_headers()
+                        )
+
                     set_key_if_not_exists(
                         swagger["paths"][path_template_to_set][method]["responses"],
                         str(status),
                         resp_data_to_set,
                     )
+
+            if (
+                "responses" in swagger["paths"][path_template_to_set][method]
+                and len(swagger["paths"][path_template_to_set][method]["responses"])
+                == 0
+            ):
+                # add a default response if there were no responses detected,
+                # this is for compliance with the OpenAPI spec
+                content_type = (
+                    req.get_response_headers().get("content-type") or "text/plain"
+                )
+
+                swagger["paths"][path_template_to_set][method]["responses"]["200"] = {
+                    "description": "OK",
+                    "content": {},
+                }
 
     except FlowReadException as e:
         print(f"Flow file corrupted: {e}")
@@ -301,20 +371,24 @@ def main():
             )
         sys.exit(1)
 
+    def is_param(param_value):
+        return args.param_regex.match(param_value) is not None
+
     new_path_templates.sort()
 
     # add suggested path templates
     # basically inspects urls and replaces segments containing only numbers with a parameter
     new_path_templates_with_suggestions = []
-    for idx, path in enumerate(new_path_templates):
+    for path in new_path_templates:
         # check if path contains number-only segments
         segments = path.split("/")
-        if any(segment.isdigit() for segment in segments):
+        has_param = any(is_param(segment) for segment in segments)
+        if has_param:
             # replace digit segments with {id}, {id1}, {id2} etc
             new_segments = []
             param_id = 0
             for segment in segments:
-                if segment.isdigit():
+                if is_param(segment):
                     param_name = "id" + str(param_id)
                     if param_id == 0:
                         param_name = "id"
@@ -326,7 +400,9 @@ def main():
             # prepend the suggested path to the new_path_templates list
             if suggested_path not in new_path_templates_with_suggestions:
                 new_path_templates_with_suggestions.append("ignore:" + suggested_path)
-        new_path_templates_with_suggestions.append("ignore:" + path)
+
+        if not has_param or not args.suppress_params:
+            new_path_templates_with_suggestions.append("ignore:" + path)
 
     # remove the ending comments not to add them twice
 

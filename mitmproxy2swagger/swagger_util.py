@@ -1,4 +1,7 @@
+# -*- coding: utf-8 -*-
 import urllib
+import uuid
+from typing import Any, List
 
 VERBS = [
     "add",
@@ -78,31 +81,85 @@ def url_to_params(url, path_template):
     return params
 
 
+def request_to_headers(headers: dict[str, List[Any]], add_example: bool = False):
+    """When given an url and its path template, generates the parameters section of the
+    request."""
+    params = []
+    if headers:
+        for key in headers:
+            h = {
+                "name": key,
+                "in": "header",
+                "required": False,
+                "schema": {"type": "number" if headers[key][0].isdigit() else "string"},
+            }
+            if add_example:
+                h["example"] = headers[key][0]
+            params.append(h)
+    return params
+
+
+def response_to_headers(headers):
+    header = {}
+    if headers:
+        for key in headers:
+            header[key] = {
+                "description": headers[key][0],
+                "schema": {"type": "number" if headers[key][0].isdigit() else "string"},
+            }
+    return header
+
+
 def value_to_schema(value):
     # check if value is a number
-    if type(value) == int or type(value) == float:
+    if type(value) is int or type(value) is float:
         return {"type": "number"}
     # check if value is a boolean
-    elif type(value) == bool:
+    elif isinstance(value, bool):
         return {"type": "boolean"}
     # check if value is a string
-    elif type(value) == str:
+    elif isinstance(value, str):
         return {"type": "string"}
     # check if value is a list
-    elif type(value) == list:
+    elif isinstance(value, list):
         if len(value) == 0:
             return {"type": "array", "items": {}}
 
         return {"type": "array", "items": value_to_schema(value[0])}
     # check if value is a dict
-    elif type(value) == dict:
+    elif isinstance(value, dict):
+        all_keys_are_numeric = all(is_numeric_string(key) for key in value)
+        all_keys_are_uuid = all(is_uuid(key) for key in value)
+        keys_are_generic = all_keys_are_numeric or all_keys_are_uuid
+
+        if keys_are_generic and len(value) > 0:
+            return {
+                "type": "object",
+                "additionalProperties": value_to_schema(list(value.values())[0]),
+            }
         return {
             "type": "object",
             "properties": {key: value_to_schema(value[key]) for key in value},
         }
     # if it is none, return null
     elif value is None:
-        return {"type": "object"}
+        return {"type": "object", "nullable": True}
+
+
+def is_uuid(key):
+    return isinstance(key, str) and is_valid_uuid(key)
+
+
+def is_numeric_string(key):
+    return isinstance(key, str) and key.isnumeric()
+
+
+def is_valid_uuid(val):
+    try:
+        uuid.UUID(str(val))
+        return True
+    except ValueError:
+        return False
 
 
 MAX_EXAMPLE_ARRAY_ELEMENTS = 10
@@ -111,14 +168,14 @@ MAX_EXAMPLE_OBJECT_PROPERTIES = 150
 
 # recursively scan an example value and limit the number of elements and properties
 def limit_example_size(example):
-    if type(example) == list:
+    if isinstance(example, list):
         new_list = []
         for element in example:
             if len(new_list) >= MAX_EXAMPLE_ARRAY_ELEMENTS:
                 break
             new_list.append(limit_example_size(element))
         return new_list
-    elif type(example) == dict:
+    elif isinstance(example, dict):
         new_dict = {}
         for key in example:
             if len(new_dict) >= MAX_EXAMPLE_OBJECT_PROPERTIES:
